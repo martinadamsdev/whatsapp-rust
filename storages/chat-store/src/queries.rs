@@ -297,6 +297,41 @@ impl ChatStore {
             .collect())
     }
 
+    /// All stored contacts for this device, ordered by best display name.
+    pub async fn contacts(&self, limit: i64) -> Result<Vec<ContactEntry>> {
+        use schema::contacts::dsl;
+        let device_id = self.device_id();
+        let rows: Vec<ContactRow> = self
+            .db()
+            .run(move |conn| {
+                dsl::contacts
+                    .filter(dsl::device_id.eq(device_id))
+                    .select((
+                        dsl::jid,
+                        dsl::push_name,
+                        dsl::full_name,
+                        dsl::first_name,
+                        dsl::business_name,
+                    ))
+                    .limit(limit)
+                    .load(conn)
+                    .map_err(db_err)
+            })
+            .await?;
+        Ok(rows
+            .into_iter()
+            .map(
+                |(jid, push_name, full_name, first_name, business_name)| ContactEntry {
+                    jid: parse_jid(&jid),
+                    push_name,
+                    full_name,
+                    first_name,
+                    business_name,
+                },
+            )
+            .collect())
+    }
+
     pub async fn contact(&self, jid: &Jid) -> Result<Option<ContactEntry>> {
         use schema::contacts::dsl;
         let device_id = self.device_id();
