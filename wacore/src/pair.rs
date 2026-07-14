@@ -241,18 +241,6 @@ impl PairUtils {
             .unwrap_or_default()
             .to_vec();
 
-        let account_sig_prefix = if is_hosted_account {
-            ADV_HOSTED_PREFIX_ACCOUNT_SIGNATURE
-        } else {
-            ADV_PREFIX_ACCOUNT_SIGNATURE
-        };
-
-        let msg_to_verify = Self::concat_bytes(&[
-            account_sig_prefix,
-            &inner_details_bytes,
-            device_state.identity_key.public_key.public_key_bytes(),
-        ]);
-
         let account_public_key = PublicKey::from_djb_public_key_bytes(account_sig_key_bytes)
             .map_err(|e| PairCryptoError {
                 code: 401,
@@ -260,16 +248,46 @@ impl PairUtils {
                 source: e.into(),
             })?;
 
-        if !account_public_key.verify_signature(&msg_to_verify, account_sig_bytes) {
+        // 某些账号类型（如 WhatsApp Business App）的容器 account_type 声明与
+        // 实际签名前缀不一致：先按声明校验，失败则用另一套前缀重试，
+        // 以实际命中的前缀决定后续设备签名的前缀（对照 whatsmeow 行为）。
+        let verify_with = |hosted: bool| -> bool {
+            let prefix = if hosted {
+                ADV_HOSTED_PREFIX_ACCOUNT_SIGNATURE
+            } else {
+                ADV_PREFIX_ACCOUNT_SIGNATURE
+            };
+            let msg = Self::concat_bytes(&[
+                prefix,
+                &inner_details_bytes,
+                device_state.identity_key.public_key.public_key_bytes(),
+            ]);
+            account_public_key.verify_signature(&msg, account_sig_bytes)
+        };
+
+        let effective_hosted = if verify_with(is_hosted_account) {
+            is_hosted_account
+        } else if verify_with(!is_hosted_account) {
+            log::warn!(
+                target: "wacore::pair",
+                "ADV account signature matched the {} prefix although container account_type={:?}; continuing with matched variant",
+                if is_hosted_account { "non-hosted" } else { "hosted" },
+                hmac_container.account_type
+            );
+            !is_hosted_account
+        } else {
             return Err(PairCryptoError {
                 code: 401,
                 text: "signature-mismatch",
-                source: anyhow::anyhow!("libsignal signature verification failed"),
+                source: anyhow::anyhow!(
+                    "libsignal signature verification failed with both prefix variants (account_type={:?})",
+                    hmac_container.account_type
+                ),
             });
-        }
+        };
 
         // 3. Generate our device signature
-        let device_sig_prefix = if is_hosted_account {
+        let device_sig_prefix = if effective_hosted {
             ADV_HOSTED_PREFIX_DEVICE_SIGNATURE_VERIFICATION
         } else {
             ADV_PREFIX_DEVICE_SIGNATURE_GENERATE
