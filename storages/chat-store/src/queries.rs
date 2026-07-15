@@ -111,6 +111,56 @@ struct MessageRow {
     revoked: bool,
 }
 
+#[derive(diesel::QueryableByName)]
+struct FtsMessageRow {
+    #[diesel(sql_type = diesel::sql_types::Integer)]
+    device_id: i32,
+    #[diesel(sql_type = diesel::sql_types::Text)]
+    chat_jid: String,
+    #[diesel(sql_type = diesel::sql_types::Text)]
+    msg_id: String,
+    #[diesel(sql_type = diesel::sql_types::Text)]
+    sender_jid: String,
+    #[diesel(sql_type = diesel::sql_types::Bool)]
+    from_me: bool,
+    #[diesel(sql_type = diesel::sql_types::BigInt)]
+    timestamp_ms: i64,
+    #[diesel(sql_type = diesel::sql_types::Text)]
+    kind: String,
+    #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
+    text_content: Option<String>,
+    #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Binary>)]
+    proto: Option<Vec<u8>>,
+    #[diesel(sql_type = diesel::sql_types::Integer)]
+    status: i32,
+    #[diesel(sql_type = diesel::sql_types::Bool)]
+    starred: bool,
+    #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::BigInt>)]
+    edited_at_ms: Option<i64>,
+    #[diesel(sql_type = diesel::sql_types::Bool)]
+    revoked: bool,
+}
+
+impl From<FtsMessageRow> for MessageRow {
+    fn from(row: FtsMessageRow) -> Self {
+        MessageRow {
+            device_id: row.device_id,
+            chat_jid: row.chat_jid,
+            msg_id: row.msg_id,
+            sender_jid: row.sender_jid,
+            from_me: row.from_me,
+            timestamp_ms: row.timestamp_ms,
+            kind: row.kind,
+            text_content: row.text_content,
+            proto: row.proto,
+            status: row.status,
+            starred: row.starred,
+            edited_at_ms: row.edited_at_ms,
+            revoked: row.revoked,
+        }
+    }
+}
+
 impl From<MessageRow> for StoredMessage {
     fn from(row: MessageRow) -> Self {
         let message = row.proto.as_deref().and_then(|bytes| {
@@ -211,29 +261,38 @@ impl ChatStore {
         Ok(rows.into_iter().map(Into::into).collect())
     }
 
-    /// Global full-text-ish search over message text (LIKE, newest first).
+    /// Global full-text fuzzy search over message text, newest first.
+    /// Runs LIKE '%needle%' against the trigram-tokenized FTS5 index
+    /// (index-accelerated for needles of 3+ chars, any script incl. CJK).
     pub async fn search_messages(&self, needle: &str, limit: i64) -> Result<Vec<StoredMessage>> {
-        use schema::messages::dsl;
+        use diesel::sql_types::{BigInt, Integer, Text};
         let limit = limit.max(0);
         let device_id = self.device_id();
-        let pattern = format!("%{}%", needle.replace('%', "\\%").replace('_', "\\_"));
-        let rows: Vec<MessageRow> = self
+        let escaped = needle
+            .replace('\\', "\\\\")
+            .replace('%', "\\%")
+            .replace('_', "\\_");
+        let pattern = format!("%{escaped}%");
+        let rows: Vec<FtsMessageRow> = self
             .db()
             .run(move |conn| {
-                dsl::messages
-                    .filter(
-                        dsl::device_id
-                            .eq(device_id)
-                            .and(dsl::revoked.eq(false))
-                            .and(dsl::text_content.like(&pattern)),
-                    )
-                    .order((dsl::timestamp_ms.desc(), dsl::msg_id.desc()))
-                    .limit(limit)
-                    .load(conn)
-                    .map_err(db_err)
+                diesel::sql_query(
+                    "SELECT m.device_id, m.chat_jid, m.msg_id, m.sender_jid, m.from_me, \
+                     m.timestamp_ms, m.kind, m.text_content, m.proto, m.status, m.starred, \
+                     m.edited_at_ms, m.revoked \
+                     FROM messages_fts f JOIN messages m ON m.rowid = f.rowid \
+                     WHERE f.text_content LIKE ? ESCAPE '\\' \
+                       AND m.device_id = ? AND m.revoked = 0 \
+                     ORDER BY m.timestamp_ms DESC, m.msg_id DESC LIMIT ?",
+                )
+                .bind::<Text, _>(&pattern)
+                .bind::<Integer, _>(device_id)
+                .bind::<BigInt, _>(limit)
+                .load(conn)
+                .map_err(db_err)
             })
             .await?;
-        Ok(rows.into_iter().map(Into::into).collect())
+        Ok(rows.into_iter().map(|row| MessageRow::from(row).into()).collect())
     }
 
     /// Global listing of messages of a given kind (newest first), across all chats.
