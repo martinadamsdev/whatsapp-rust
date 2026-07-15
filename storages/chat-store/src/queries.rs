@@ -211,6 +211,60 @@ impl ChatStore {
         Ok(rows.into_iter().map(Into::into).collect())
     }
 
+    /// Global full-text-ish search over message text (LIKE, newest first).
+    pub async fn search_messages(&self, needle: &str, limit: i64) -> Result<Vec<StoredMessage>> {
+        use schema::messages::dsl;
+        let limit = limit.max(0);
+        let device_id = self.device_id();
+        let pattern = format!("%{}%", needle.replace('%', "\\%").replace('_', "\\_"));
+        let rows: Vec<MessageRow> = self
+            .db()
+            .run(move |conn| {
+                dsl::messages
+                    .filter(
+                        dsl::device_id
+                            .eq(device_id)
+                            .and(dsl::revoked.eq(false))
+                            .and(dsl::text_content.like(&pattern)),
+                    )
+                    .order((dsl::timestamp_ms.desc(), dsl::msg_id.desc()))
+                    .limit(limit)
+                    .load(conn)
+                    .map_err(db_err)
+            })
+            .await?;
+        Ok(rows.into_iter().map(Into::into).collect())
+    }
+
+    /// Global listing of messages of a given kind (newest first), across all chats.
+    pub async fn messages_by_kind(
+        &self,
+        kind: MessageKind,
+        limit: i64,
+    ) -> Result<Vec<StoredMessage>> {
+        use schema::messages::dsl;
+        let limit = limit.max(0);
+        let device_id = self.device_id();
+        let kind = kind.as_str().to_string();
+        let rows: Vec<MessageRow> = self
+            .db()
+            .run(move |conn| {
+                dsl::messages
+                    .filter(
+                        dsl::device_id
+                            .eq(device_id)
+                            .and(dsl::revoked.eq(false))
+                            .and(dsl::kind.eq(&kind)),
+                    )
+                    .order((dsl::timestamp_ms.desc(), dsl::msg_id.desc()))
+                    .limit(limit)
+                    .load(conn)
+                    .map_err(db_err)
+            })
+            .await?;
+        Ok(rows.into_iter().map(Into::into).collect())
+    }
+
     pub async fn message(&self, chat: &Jid, msg_id: &str) -> Result<Option<StoredMessage>> {
         use schema::messages::dsl;
         let device_id = self.device_id();
